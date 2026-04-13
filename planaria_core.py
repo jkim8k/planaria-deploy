@@ -2094,7 +2094,10 @@ class IntentClassifier:
         "skill", "command", "code", "test", "news", "weather", "stock", "reserve",
         ".txt", ".py", ".md",
     ]
-    _SIMPLE_DIALOG_GREETING_HINTS_KO = ["안녕", "반가", "넌 누구", "너 누구", "자기소개", "소개해", "고마워", "감사"]
+    _SIMPLE_DIALOG_GREETING_HINTS_KO = ["안녕", "반가", "넌 누구", "너 누구", "자기소개", "소개해", "고마워", "감사", "이름이 뭐", "너의 이름", "네 이름", "이름은?", "뭐라고 불러"]
+    # Identity questions get matched BEFORE action hints to avoid
+    # "이름 알려줘" being blocked by the "알려" action hint.
+    _IDENTITY_HINTS = ["이름이 뭐", "너의 이름", "네 이름", "이름은?", "뭐라고 불러", "넌 누구", "너 누구"]
     _SUMMARY_HINTS = ["요약", "정리", "브리핑", "summary", "summarize"]
 
     @staticmethod
@@ -2131,6 +2134,9 @@ class IntentClassifier:
     def is_simple_dialog_query(user_text: str) -> bool:
         low = (user_text or "").strip().lower()
         if not low:
+            return True
+        # Identity questions always fast-path (even if they contain action hint substrings like "알려")
+        if any(h in low for h in IntentClassifier._IDENTITY_HINTS):
             return True
         if any(h in low for h in IntentClassifier._SIMPLE_DIALOG_ACTION_HINTS):
             return False
