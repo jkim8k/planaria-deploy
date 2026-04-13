@@ -98,6 +98,30 @@ def safe_str(s: Any) -> str:
     return s.encode("utf-8", errors="replace").decode("utf-8")
 
 
+def safe_json_dumps(obj: Any, **kwargs: Any) -> str:
+    """json.dumps that never fails on surrogate characters.
+
+    The SRT skill (and other external tools) can produce stdout with broken
+    encoding (e.g. \\udceb). Standard json.dumps with ensure_ascii=False will
+    raise UnicodeEncodeError on these. This wrapper catches that and falls back
+    to ensure_ascii=True which escapes non-ASCII characters instead.
+    """
+    kwargs.setdefault("ensure_ascii", False)
+    try:
+        return json.dumps(obj, **kwargs)
+    except UnicodeEncodeError:
+        # Strip surrogates from all string values and retry
+        def _clean(v: Any) -> Any:
+            if isinstance(v, str):
+                return v.encode("utf-8", errors="replace").decode("utf-8")
+            if isinstance(v, dict):
+                return {_clean(k): _clean(val) for k, val in v.items()}
+            if isinstance(v, list):
+                return [_clean(i) for i in v]
+            return v
+        return json.dumps(_clean(obj), **kwargs)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1055,7 +1079,7 @@ class WorkspaceTools:
             return {"ok": False, "error": "invalid skill path"}
         if not skill_dir.exists():
             return {"ok": False, "error": "skill not found"}
-        arg_json = shlex.quote(json.dumps(args, ensure_ascii=False))
+        arg_json = shlex.quote(safe_json_dumps(args))
         call_tool_script = Path("/home/jee/agent/planaria_one/call_external_tool.sh")
         if not call_tool_script.exists():
             legacy_script = Path("/home/jee/agent/planaria_one/call_tool.sh")
@@ -1564,8 +1588,13 @@ class WorkspaceTools:
     def run_shell(self, command: str, timeout_sec: int = 30) -> dict[str, Any]:
         timeout_sec = max(1, min(timeout_sec, 300))
         try:
-            proc = subprocess.run(command, shell=True, cwd=str(self.workspace), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_sec)
-            return {"ok": True, "exit_code": proc.returncode, "stdout": safe_str(proc.stdout[-12000:]), "stderr": safe_str(proc.stderr[-12000:])}
+            proc = subprocess.run(
+                command, shell=True, cwd=str(self.workspace),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace",  # never produce surrogates
+                timeout=timeout_sec,
+            )
+            return {"ok": True, "exit_code": proc.returncode, "stdout": proc.stdout[-12000:], "stderr": proc.stderr[-12000:]}
         except Exception as e:
             return {"ok": False, "error": f"shell execution failed: {str(e)}"}
 
@@ -3379,8 +3408,8 @@ class TaskExecutor:
             did_bootstrap = True
             self.engine._log_runtime({"type": "forced_memory_bootstrap", "iteration": iter_idx, "query": search_query[:200], "ok": bool(mem_result.get("ok")) if isinstance(mem_result, dict) else False})
             sanitized_mem = ToolDispatcher.compact_tool_result("search_memory", mem_result if isinstance(mem_result, dict) else {})
-            messages.append({"role": "system", "content": "Tool result (search_memory):\n" + json.dumps(sanitized_mem, ensure_ascii=False)[:2500]})
-            ctx.last_tool_note = json.dumps(sanitized_mem, ensure_ascii=False)[:800]
+            messages.append({"role": "system", "content": "Tool result (search_memory):\n" + safe_json_dumps(sanitized_mem, ensure_ascii=False)[:2500]})
+            ctx.last_tool_note = safe_json_dumps(sanitized_mem, ensure_ascii=False)[:800]
             if ctx.should_force_search and not ctx.associative_followup_done:
                 assoc_q = self._build_associative_query_from_memory(search_query, mem_result if isinstance(mem_result, dict) else {})
                 if assoc_q and assoc_q != ctx.forced_search_query:
@@ -3395,8 +3424,8 @@ class TaskExecutor:
                     })
                     self._ingest_search_hits(ctx, assoc_result if isinstance(assoc_result, dict) else {})
                     sanitized_assoc = ToolDispatcher.compact_tool_result("web_search", assoc_result if isinstance(assoc_result, dict) else {})
-                    messages.append({"role": "system", "content": "Tool result (web_search_associative):\n" + json.dumps(sanitized_assoc, ensure_ascii=False)[:2500]})
-                    ctx.last_tool_note = json.dumps(sanitized_assoc, ensure_ascii=False)[:800]
+                    messages.append({"role": "system", "content": "Tool result (web_search_associative):\n" + safe_json_dumps(sanitized_assoc, ensure_ascii=False)[:2500]})
+                    ctx.last_tool_note = safe_json_dumps(sanitized_assoc, ensure_ascii=False)[:800]
 
         if ctx.should_force_search and ctx.forced_search_query and not ctx.forced_search_done:
             ctx.forced_search_done = True
@@ -3406,8 +3435,8 @@ class TaskExecutor:
             self.engine._log_runtime({"type": "forced_search_bootstrap", "iteration": iter_idx, "query": ctx.forced_search_query[:200], "ok": bool(web_result.get("ok")) if isinstance(web_result, dict) else False})
             self._ingest_search_hits(ctx, web_result if isinstance(web_result, dict) else {})
             sanitized_web = ToolDispatcher.compact_tool_result("web_search", web_result if isinstance(web_result, dict) else {})
-            messages.append({"role": "system", "content": "Tool result (web_search):\n" + json.dumps(sanitized_web, ensure_ascii=False)[:2500]})
-            ctx.last_tool_note = json.dumps(sanitized_web, ensure_ascii=False)[:800]
+            messages.append({"role": "system", "content": "Tool result (web_search):\n" + safe_json_dumps(sanitized_web, ensure_ascii=False)[:2500]})
+            ctx.last_tool_note = safe_json_dumps(sanitized_web, ensure_ascii=False)[:800]
 
         if did_bootstrap:
             PromptBuilder.append_replan_guard_once(messages)
@@ -3461,8 +3490,8 @@ class TaskExecutor:
                 self._process_search_result(messages, ctx, result, iter_idx)
 
             sanitized_result = ToolDispatcher.compact_tool_result(name, result)
-            ctx.last_tool_note = json.dumps(sanitized_result, ensure_ascii=False)[:800]
-            messages.append({"role": "system", "content": f"Tool result ({name}):\n" + json.dumps(sanitized_result, ensure_ascii=False)[:2500]})
+            ctx.last_tool_note = safe_json_dumps(sanitized_result, ensure_ascii=False)[:800]
+            messages.append({"role": "system", "content": f"Tool result ({name}):\n" + safe_json_dumps(sanitized_result, ensure_ascii=False)[:2500]})
 
         # Check for context reask in assistant text alongside tool calls
         if IntentClassifier.is_context_reask_text(text):
@@ -3504,8 +3533,8 @@ class TaskExecutor:
                 })
                 self._ingest_search_hits(ctx, skeptical_result if isinstance(skeptical_result, dict) else {})
                 sanitized_sk = ToolDispatcher.compact_tool_result("web_search", skeptical_result if isinstance(skeptical_result, dict) else {})
-                messages.append({"role": "system", "content": "Tool result (web_search_skeptical):\n" + json.dumps(sanitized_sk, ensure_ascii=False)[:2500]})
-                ctx.last_tool_note = json.dumps(sanitized_sk, ensure_ascii=False)[:800]
+                messages.append({"role": "system", "content": "Tool result (web_search_skeptical):\n" + safe_json_dumps(sanitized_sk, ensure_ascii=False)[:2500]})
+                ctx.last_tool_note = safe_json_dumps(sanitized_sk, ensure_ascii=False)[:800]
 
         if IntentClassifier.is_summary_request(last_user_text) and hit_count >= 3 and uniq_count >= 2:
             ctx.force_finalize_mode = True
