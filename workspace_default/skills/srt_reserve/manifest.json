@@ -1,0 +1,63 @@
+{
+  "name": "srt_reserve",
+  "description": "SRT 열차 검색, 예약, 일괄예약, 조회, 취소. 온보딩에서 등록한 SRT 계정을 자동으로 사용합니다.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "search",
+          "reserve",
+          "batch_reserve",
+          "my_reservations",
+          "cancel"
+        ],
+        "description": "search: 단일 날짜 열차 검색, reserve: 단일 예약, batch_reserve: 여러 날짜 일괄 검색+예약, my_reservations: 예약 조회, cancel: 취소"
+      },
+      "dep": {
+        "type": "string",
+        "description": "출발역 (e.g. 평택지제, 수서)"
+      },
+      "arr": {
+        "type": "string",
+        "description": "도착역 (e.g. 수서, 부산)"
+      },
+      "date": {
+        "type": "string",
+        "description": "yyyyMMdd (e.g. 20260405). batch_reserve에서는 시작일."
+      },
+      "time": {
+        "type": "string",
+        "description": "hhmmss (e.g. 075800). 검색 시작 시각."
+      },
+      "target_time": {
+        "type": "string",
+        "description": "batch_reserve 전용: 정확히 맞추려는 출발시각 (hhmm, e.g. 0758). 이 시각의 열차만 예약."
+      },
+      "days": {
+        "type": "integer",
+        "description": "batch_reserve 전용: 시작일로부터 며칠간 검색할지 (기본 30)"
+      },
+      "weekdays_only": {
+        "type": "boolean",
+        "description": "batch_reserve 전용: true면 평일(월~금)만 예약 (기본 false)"
+      },
+      "weekends_only": {
+        "type": "boolean",
+        "description": "batch_reserve 전용: true면 주말(토,일)만 예약 (기본 false)"
+      },
+      "train_index": {
+        "type": "integer",
+        "description": "reserve 전용: search 결과의 index"
+      },
+      "reservation_number": {
+        "type": "integer",
+        "description": "cancel 전용: 예약번호"
+      }
+    },
+    "required": [
+      "action"
+    ]
+  }
+}

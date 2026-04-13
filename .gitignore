@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.uv-cache/
+.tmp_eval/
+logs/
+*.log
+.claude/
+secrets.json
+key_config.json
+workspace_srttest/
+workspace_*/memory/
+workspace_*/data/
+workspace_*/logs/
