@@ -4735,12 +4735,22 @@ class AgentEngine:
                 return stripped
 
             skip_web_replan = pre_prompt_class in ("skill_ops", "direct_dialog", "local_time", "memory_focused", "config_ops")
+            # Skill/schedule operations should NEVER be decomposed by JobBreaker.
+            # The tool (srt_reserve, schedule_task, etc.) handles the full request.
+            # JobBreaker decomposition causes confusion: it creates "search first" sub-tasks
+            # that waste time on web_search and then the LLM summarizes the empty web results
+            # instead of the actual tool output. V4.1 regression fix.
+            skip_job_breaker = pre_prompt_class in ("skill_ops", "schedule_ops", "direct_dialog", "local_time", "email_ops")
 
-            job_breaker = JobBreakerEngine(self.client)
-            job_plan = job_breaker.break_job(user_text)
-            self._log_runtime({"type": "job_plan_initial", "plan": job_plan, "pre_prompt_class": pre_prompt_class})
+            if skip_job_breaker:
+                job_plan = {"refined_goal": user_text, "constraints": [], "tasks": [user_text]}
+                self._log_runtime({"type": "job_plan_skipped", "pre_prompt_class": pre_prompt_class, "reason": "direct_execution_class"})
+            else:
+                job_breaker = JobBreakerEngine(self.client)
+                job_plan = job_breaker.break_job(user_text)
+                self._log_runtime({"type": "job_plan_initial", "plan": job_plan, "pre_prompt_class": pre_prompt_class})
 
-            if not skip_web_replan and self._plan_needs_web_replan(user_text, job_plan):
+            if not skip_web_replan and not skip_job_breaker and self._plan_needs_web_replan(user_text, job_plan):
                 planning_query = ToolDispatcher.normalize_web_search_query(user_text) or user_text.strip()[:240]
                 planning_search = self.tools.web_search(planning_query)
                 planning_results = planning_search.get("results", []) if isinstance(planning_search, dict) else []
