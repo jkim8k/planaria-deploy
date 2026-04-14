@@ -23,6 +23,18 @@ def load_creds():
             srt_pw = secrets.get(secret_key, srt_pw)
     return srt_id, srt_pw
 
+# SRT station name aliases — LLM often uses short names
+_STATION_ALIASES = {
+    "지제": "평택지제",
+    "동탄": "동탄",
+    "오송": "오송",
+    "천안아산": "천안아산",
+    "천안": "천안아산",
+}
+
+def _normalize_station(name: str) -> str:
+    return _STATION_ALIASES.get(name, name)
+
 def main():
     raw = sys.argv[1] if len(sys.argv) > 1 else "{}"
     try:
@@ -30,6 +42,12 @@ def main():
     except Exception:
         print(json.dumps({"ok": False, "error": "invalid JSON args"}))
         return
+
+    # Normalize station names before any action
+    if "dep" in args:
+        args["dep"] = _normalize_station(args["dep"])
+    if "arr" in args:
+        args["arr"] = _normalize_station(args["arr"])
 
     action = args.get("action", "search")
 
