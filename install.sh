@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ── PLANARIA_ONE installer ──
-# Usage: curl -sSL https://raw.githubusercontent.com/jkim8k/planaria-deploy/main/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/jkim8k/planaria/deploy/install.sh | bash
 
-REPO="https://github.com/jkim8k/planaria-deploy.git"
-BRANCH="main"
+REPO="https://github.com/jkim8k/planaria.git"
+BRANCH="deploy"
 INSTALL_DIR="${PLANARIA_DIR:-$HOME/planaria}"
 
 echo ""
