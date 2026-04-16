@@ -8,7 +8,7 @@ Single-file agent runtime (`planaria_core.py`) with:
 - multi-route LLM fallback
 
 This repository is intentionally documentation-light.
-`README.md` is the canonical project document.
+`README.md` is the primary 운영 문서이며, 기타 보고서/백업 문서는 보조 참고 자료로 취급한다.
 
 ## 1. Project Scope
 
@@ -16,6 +16,8 @@ Core entrypoints:
 - `planaria_core.py`: engine + tools + runners
 - `planaria_run.sh`: launcher wrapper (`uv run python ...`)
 - `tester_planaria_one.py`: E2E evaluator
+- `tester_v4.py`: deployment-gate evaluator
+- `tester_common.py`: shared tester utilities
 - `test_*.py`: unit/integration tests
 
 ## 2. Local Setup
@@ -56,6 +58,26 @@ One-shot run:
 - `--mode ipc`: JSONL stdin/stdout mode (programmatic)
 
 Scheduler always runs in background for non-IPC modes.
+
+### IPC protocol (current)
+
+Input (JSONL):
+- `{"type":"message","content":"...","source":"tester","user_id":"u1","turn_id":"optional"}`
+- `{"type":"cancel","turn_id":"optional"}`
+- `{"type":"exit"}`
+
+Output (JSONL):
+- `{"type":"ready", ...}`
+- `{"type":"tool_call","name":"...","args":{...},"iteration":N,"turn_id":"..."}`
+- `{"type":"reflection_check", ... ,"turn_id":"..."}`
+- `{"type":"reflection_retry", ... ,"turn_id":"..."}`
+- `{"type":"cancel_ack","turn_id":"..."}`
+- `{"type":"response","content":"...","tool_calls":[...],"elapsed_sec":N,"cancelled":bool,"turn_id":"..."}`
+- `{"type":"error","message":"...","turn_id":"..."?}`
+
+Notes:
+- `turn_id`는 요청-응답 상관관계를 위한 optional 필드이며, 전달되면 outbound 이벤트에도 에코된다.
+- `cancel`은 cooperative cancel 신호로 처리된다.
 
 ## 4. Workspace Model
 
@@ -118,11 +140,18 @@ E2E evaluator:
 python3 tester_planaria_one.py --agent fox --task 1,31,34 --timeout 240
 ```
 
+Tester architecture and branch audit:
+
+```bash
+cat TESTER_PROJECT_AUDIT_AND_GUIDE.md
+```
+
 ## 8. Notes
 
 - `workspace_*` may be dirty during local runs (memory/schedule/log changes).
 - `call_external_tool.sh` is used for external skill execution.
-- Keep this README aligned with real code behavior. Treat other old planning/history docs as removed.
+- Keep this README aligned with real code behavior.
+- `TESTER_PROJECT_AUDIT_AND_GUIDE.md`, `BRANCH_RECURRING_DETAILED.md`, `backup/*`, `*.bak.py`, `*.pre_refactor.py`는 히스토리/감사용 자료다.
 
 ## 9. Thinking Mechanism Upgrade Plan
 

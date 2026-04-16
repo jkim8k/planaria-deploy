@@ -3698,6 +3698,16 @@ class TaskExecutor:
             return self._handle_local_time_fastpath(source, user_id)
 
         for iter_idx in range(1, self.config.max_tool_iterations + 1):
+            # Cooperative cancellation — if IPC client signalled cancel, exit
+            # the iteration loop early rather than keep spinning reflection.
+            if self.engine._cancel_event.is_set():
+                self.engine._log_runtime({
+                    "type": "cancelled",
+                    "iteration": iter_idx,
+                    "tool_calls": ctx.total_tool_calls,
+                })
+                return "[cancelled by client]"
+
             self._manage_context(messages, ctx, iter_idx)
 
             # Forced bootstrap on first iterations
@@ -3843,6 +3853,9 @@ class AgentEngine:
         # Conversation continuity: remember last turn for follow-up reclassification
         self._last_prompt_class: str = ""
         self._last_user_query: str = ""
+        # Cooperative cancellation (set by IPCRunner when a cancel request
+        # arrives mid-respond). Checked at safe points in execute_task.
+        self._cancel_event: threading.Event = threading.Event()
         self._bootstrap_identity_memory()
 
     def _resolve_config_secrets(self) -> None:
@@ -5126,6 +5139,7 @@ class IPCRunner:
 
     def __init__(self, engine: AgentEngine):
         import sys
+        from queue import Queue
         self.engine = engine
         self._sys = sys
         # Save the real stdout for JSON output, then redirect sys.stdout to stderr
@@ -5134,14 +5148,37 @@ class IPCRunner:
         self._json_out = sys.stdout
         sys.stdout = sys.stderr
         self._tool_trace: list[dict[str, Any]] = []
+        self._current_turn_id: str = ""  # echoed on all messages during a turn
+        # Stdin is read on a background thread so the main loop can receive a
+        # `cancel` request *while* respond() is still running. Request items
+        # land on this queue; the main loop consumes `message`/`exit` events
+        # and cancel requests are handled inline by the reader thread (they
+        # set a threading.Event on the engine).
+        self._request_queue: Queue = Queue()
+        self._reader_thread: threading.Thread | None = None
+        self._shutdown = False
         self._install_runtime_hook()
 
     def _emit(self, payload: dict[str, Any]) -> None:
+        # Stamp every outbound message with the active turn_id so clients can
+        # strictly correlate streamed events with their originating request.
+        if self._current_turn_id and "turn_id" not in payload:
+            payload = {**payload, "turn_id": self._current_turn_id}
         try:
             self._json_out.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self._json_out.flush()
         except Exception:
             pass
+
+    @staticmethod
+    def make_ready_event(agent_name: str, onboarding_stage: str, onboarding_required: bool) -> dict[str, Any]:
+        stage = (onboarding_stage or "").strip()
+        return {
+            "type": "ready",
+            "agent": agent_name,
+            "onboarding_stage": stage or "done",
+            "onboarding_required": bool(onboarding_required),
+        }
 
     def _install_runtime_hook(self) -> None:
         """Wrap engine._log_runtime to also emit IPC trace events for tool calls."""
@@ -5191,26 +5228,23 @@ class IPCRunner:
 
         self.engine._log_runtime = wrapped  # type: ignore[method-assign]
 
-    def run_forever(self) -> None:
-        # Auto-finish onboarding if not done — IPC mode assumes pre-configured workspace
-        stage = self.engine._onboarding_stage()
-        if stage and stage != "done":
-            self._emit({
-                "type": "error",
-                "message": f"Workspace is not fully onboarded (stage={stage}). "
-                           f"Run `planaria --agent <name> --mode cli` first to complete onboarding.",
-            })
-            return
+    def _reader_loop(self) -> None:
+        """Background stdin reader: keeps cancel requests responsive while
+        the main loop is busy inside engine.respond().
 
-        self._emit({"type": "ready", "agent": self.engine.config.agent_name})
-
-        while True:
+        - `cancel` sets engine._cancel_event and emits cancel_ack immediately.
+        - Everything else (message, exit, unknown) is forwarded via queue to
+          the main loop for in-order processing.
+        """
+        while not self._shutdown:
             try:
                 line = self._sys.stdin.readline()
             except (EOFError, KeyboardInterrupt):
-                break
+                self._request_queue.put({"type": "__eof"})
+                return
             if not line:
-                break  # EOF
+                self._request_queue.put({"type": "__eof"})
+                return
             line = line.strip()
             if not line:
                 continue
@@ -5219,8 +5253,34 @@ class IPCRunner:
             except json.JSONDecodeError as e:
                 self._emit({"type": "error", "message": f"invalid json: {e}"})
                 continue
+            rtype = req.get("type", "message")
+            if rtype == "cancel":
+                # Handle cancel inline (no queueing) so it reaches the engine
+                # while respond() is still running.
+                self.engine._cancel_event.set()
+                self._emit({"type": "cancel_ack", "turn_id": req.get("turn_id", "")})
+                continue
+            self._request_queue.put(req)
+
+    def run_forever(self) -> None:
+        # IPC mode also supports onboarding conversations via normal message exchange.
+        stage = self.engine._onboarding_stage()
+        has_primary = bool(self.engine.config.api_key)
+        has_fallback = bool(self.engine.config.fallback_routes)
+        required = not (stage == "done" and (has_primary or has_fallback))
+        if not stage and required:
+            stage = "wait_name"
+        elif stage == "done" and required:
+            stage = "wait_api_key"
+        self._emit(self.make_ready_event(self.engine.config.agent_name, stage, required))
+
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+        while True:
+            req = self._request_queue.get()
             req_type = req.get("type", "message")
-            if req_type == "exit":
+            if req_type == "__eof" or req_type == "exit":
                 break
             if req_type != "message":
                 self._emit({"type": "error", "message": f"unknown request type: {req_type}"})
@@ -5232,20 +5292,30 @@ class IPCRunner:
             source = str(req.get("source") or "ipc")
             user_id = str(req.get("user_id") or "ipc")
 
+            self._current_turn_id = str(req.get("turn_id") or "")
             self._tool_trace = []
+            # Clear any stale cancel flag from prior turn
+            self.engine._cancel_event.clear()
             t0 = time.time()
             try:
                 answer = self.engine.respond(content, source=source, user_id=user_id)
             except Exception as e:
                 self._emit({"type": "error", "message": f"engine error: {type(e).__name__}: {e}"})
+                self._current_turn_id = ""
                 continue
             elapsed = time.time() - t0
+            cancelled = self.engine._cancel_event.is_set()
             self._emit({
                 "type": "response",
                 "content": answer,
                 "tool_calls": list(self._tool_trace),
                 "elapsed_sec": round(elapsed, 2),
+                "cancelled": cancelled,
             })
+            self._current_turn_id = ""
+            self.engine._cancel_event.clear()
+
+        self._shutdown = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
