@@ -5122,18 +5122,21 @@ class IPCRunner:
     """Machine-readable runner for programmatic interaction (e.g. planaria_tester).
 
     Protocol (JSON Lines over stdin/stdout):
-      Input  (one JSON per line):
-        {"type": "message", "content": "...", "source": "tester", "user_id": "u1"}
-        {"type": "exit"}
+      Input (one JSON per line):
+        {"type":"message","content":"...","source":"tester","user_id":"u1","turn_id":"optional"}
+        {"type":"cancel","turn_id":"optional"}
+        {"type":"exit"}
       Output (one JSON per line):
-        {"type": "ready"}                                  # printed once at startup
-        {"type": "tool_call", "name": "...", "args": {...}, "iteration": N}
-        {"type": "tool_result", "name": "...", "ok": bool, "summary": "..."}
-        {"type": "response", "content": "...", "tool_calls": [...], "iterations": N, "elapsed_sec": N}
-        {"type": "error", "message": "..."}
+        {"type":"ready", ...}  # printed once at startup
+        {"type":"tool_call","name":"...","args":{...},"iteration":N,"turn_id":"..."}
+        {"type":"reflection_check", ... ,"turn_id":"..."}
+        {"type":"reflection_retry", ... ,"turn_id":"..."}
+        {"type":"cancel_ack","turn_id":"..."}
+        {"type":"response","content":"...","tool_calls":[...],"elapsed_sec":N,"cancelled":bool,"turn_id":"..."}
+        {"type":"error","message":"...","turn_id":"..."?}
 
     All output goes to stdout as single JSON lines (no pretty-print).
-    Trace events (tool_call/tool_result) are emitted live during execution
+    Trace events (tool_call/reflection_*) are emitted live during execution
     via a hook on the engine's runtime log.
     """
 
