@@ -2200,10 +2200,17 @@ class IntentClassifier:
     # "이름 알려줘" being blocked by the "알려" action hint.
     _IDENTITY_HINTS = ["이름이 뭐", "너의 이름", "네 이름", "이름은?", "뭐라고 불러", "넌 누구", "너 누구"]
     _SUMMARY_HINTS = ["요약", "정리", "브리핑", "summary", "summarize"]
+    # Narrow to direct, user-facing capability questions. Broad tokens like
+    # "기능" match stray sentences mid-conversation (e.g. users asking about
+    # external service features), so we require the phrasing to clearly refer
+    # to the agent's own capabilities.
     _CAPABILITY_HINTS = [
-        "뭘 시킬 수", "뭐를 시킬 수", "무엇을 할 수", "뭐 할 수", "할 수 있어",
-        "기능", "capability", "capabilities", "what can you do",
+        "뭘 시킬 수", "뭐를 시킬 수", "무엇을 할 수", "뭐 할 수",
+        "뭐 할수", "뭘 할 수",
+        "너 뭐 할", "너 뭘 할", "너가 할 수", "네가 할 수",
+        "capabilities", "what can you do",
     ]
+    _CAPABILITY_MAX_LEN = 50
 
     @staticmethod
     def is_local_time_query(user_text: str) -> bool:
@@ -2262,6 +2269,8 @@ class IntentClassifier:
     def is_capability_overview_query(user_text: str) -> bool:
         low = (user_text or "").strip().lower()
         if not low:
+            return False
+        if len(low) > IntentClassifier._CAPABILITY_MAX_LEN:
             return False
         return any(h in low for h in IntentClassifier._CAPABILITY_HINTS)
 
@@ -2718,13 +2727,15 @@ Your current capabilities:
             ],
             "memory_focused": [
                 "- CRITICAL: 'memory' means the workspace memory system (search_memory tool), NOT your pretrained LLM knowledge",
-                "- You MUST call search_memory to retrieve facts. Do NOT answer from your own knowledge",
-                "- If search_memory returns empty results, say '기억된 내용이 없습니다' or equivalent. Do NOT fabricate or guess",
+                "- RECALL intent ('내 이름이 뭐였지', '기억나', 'do you remember'): call search_memory to retrieve facts. Do NOT answer from pretrained knowledge.",
+                "- STORE intent ('기억해', '기억해줘', '잘 기억', 'remember this'): call remember_fact(fact=...) IMMEDIATELY to save the user-provided fact. search_memory is optional (only to check duplicates). Do NOT skip remember_fact.",
+                "- If search_memory returns empty results during recall, say '기억된 내용이 없습니다' or equivalent. Do NOT fabricate or guess",
                 "- Only report what is actually stored in the memory system",
             ],
             "workspace_ops": [
                 "- perform minimal safe workspace actions",
                 "- avoid unrelated file changes",
+                "- '워크스페이스 루트' 또는 '현재 폴더/파일 목록' 요청은 list_files를 호출해 실제 목록을 반환. 자의적인 설명만 주지 말 것.",
             ],
             "coding_ops": [
                 "- search for up-to-date best practices/APIs first, then write code based on findings",
@@ -2738,7 +2749,7 @@ Your current capabilities:
                 "  - schedule_task(run_at_utc='YYYY-MM-DDTHH:MM:SSZ', task_prompt='user request', recurrence='daily|weekly|monthly|none')",
                 "  - task_prompt = user's original request, so the agent knows what to do when triggered.",
                 "- LIST ('등록된 작업 뭐 있어?', '내 스케줄 보여줘', '예약된 거 알려줘', \"what's scheduled?\"): call list_scheduled_tasks. NEVER fabricate tasks. If empty, say so honestly.",
-                "- CANCEL ('X 작업 취소해줘'): first call list_scheduled_tasks to find the task_id, then cancel_scheduled_task(task_id=...).",
+                "- CANCEL ('X 작업 취소해줘', '방금 등록한 ... 취소'): call list_scheduled_tasks FIRST to resolve the task_id, then IMMEDIATELY call cancel_scheduled_task(task_id=...). You MUST end with cancel_scheduled_task — listing alone is not enough. Do NOT call web_search for a cancel request.",
                 "- After REGISTER, confirm what was scheduled, when (KST), and what will run.",
                 "- After LIST, present the actual returned tasks ONLY — do NOT add fake examples like 'Database Backup' or 'Log Cleanup'.",
                 "- After CANCEL, confirm which task_id was removed.",
@@ -3273,6 +3284,18 @@ class ExecutionContext:
     associative_followup_done: bool = False
     skeptical_followup_done: bool = False
     remembered_facts: set[str] = field(default_factory=set)
+    # Per-turn path-level write counter. write_file with the same target path
+    # beyond this limit is rejected so a runaway rewrite loop cannot exhaust
+    # the tool-iteration budget.
+    write_file_path_counts: dict[str, int] = field(default_factory=dict)
+    # Per-turn total count per tool name (name-level, args-independent). Used
+    # to cut off oscillating loops where args differ but the intent is the
+    # same tool being hammered (e.g., repeated web_search with tiny rewrites).
+    tool_name_counts: dict[str, int] = field(default_factory=dict)
+
+
+_WRITE_FILE_PATH_LIMIT = 3
+_TOOL_NAME_LIMIT = 6
 
 
 class TaskExecutor:
@@ -3594,9 +3617,26 @@ class TaskExecutor:
                 args = {}
             signature = ToolCallParser.tool_signature(name, args if isinstance(args, dict) else {})
             ctx.tool_signature_counts[signature] = ctx.tool_signature_counts.get(signature, 0) + 1
+            ctx.tool_name_counts[name] = ctx.tool_name_counts.get(name, 0) + 1
+
+            # Path-level dedupe for write_file: args-based signature dedup
+            # lets tiny content edits bypass the limit, so we cap rewrites per
+            # target path as well.
+            write_path = ""
+            if name == "write_file":
+                write_path = str(args.get("path", "")).strip()
+                if write_path:
+                    prior = ctx.write_file_path_counts.get(write_path, 0)
+                    ctx.write_file_path_counts[write_path] = prior + 1
 
             if ctx.selected_tool_names and name not in ctx.selected_tool_names and is_internal_tool_name(name):
                 result = {"ok": False, "error": f"Tool '{name}' is not in the allowed tool set for this task. Use only: {', '.join(ctx.selected_tool_names)}"}
+            elif name == "write_file" and write_path and ctx.write_file_path_counts[write_path] > _WRITE_FILE_PATH_LIMIT:
+                result = {"ok": False, "error": f"파일 '{write_path}'에 이미 {_WRITE_FILE_PATH_LIMIT}회 썼습니다. 추가 수정 없이 답변을 생성하세요."}
+                ctx.force_finalize_mode = True
+            elif ctx.tool_name_counts.get(name, 0) > _TOOL_NAME_LIMIT and is_internal_tool_name(name):
+                result = {"ok": False, "error": f"도구 '{name}'를 이미 {_TOOL_NAME_LIMIT}회 호출했습니다. 결과를 정리해 사용자에게 답변하세요."}
+                ctx.force_finalize_mode = True
             elif name == "remember_fact":
                 fact_key = str(args.get("fact", "")).strip().lower()
                 if fact_key and fact_key in ctx.remembered_facts:
@@ -4116,6 +4156,16 @@ class AgentEngine:
                 [n for n in all_names if n in {"search_memory", "remember_fact"}],
                 "memory_focused",
                 {"reason": "memory_recall_priority", "scores": {"memory_focused": 1}},
+            )
+        if IntentClassifier.is_memory_store_query(user_text):
+            # Explicit fact save requests must land on remember_fact directly.
+            # Keeping search_memory available lets the model check for
+            # duplicates, but remember_fact is the required action.
+            return (
+                [s for s in all_tools if str(s.get("function", {}).get("name", "")) in {"remember_fact", "search_memory"}],
+                [n for n in all_names if n in {"remember_fact", "search_memory"}],
+                "memory_focused",
+                {"reason": "memory_store_priority", "scores": {"memory_focused": 1}},
             )
         if IntentClassifier.is_simple_dialog_query(user_text):
             return [], [], "direct_dialog", {"reason": "short_social_dialog", "scores": {"direct_dialog": 1}}
