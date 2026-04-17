@@ -6,9 +6,20 @@ __pycache__/
 logs/
 *.log
 .claude/
+
+# ── Secret / credential files (must never be tracked) ──
 secrets.json
 key_config.json
-workspace_srttest/
-workspace_*/memory/
-workspace_*/data/
-workspace_*/logs/
+.env
+.env.*
+
+# ── All runtime workspaces are local-only. ──
+# workspace_default/ is kept as a skeleton sample so install.sh has a base
+# layout to copy from. Everything else is gitignored so real credentials,
+# memory, and logs never leak into git history.
+workspace_*/
+!workspace_default/
+workspace_default/memory/
+workspace_default/data/
+workspace_default/logs/
+workspace_default/secrets.json

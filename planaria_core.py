@@ -32,6 +32,7 @@ import argparse
 import email as email_mod
 import imaplib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -53,6 +54,8 @@ import requests
 
 DEFAULT_MODEL = "openai/gpt-4o"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
+KETI_CONV_API_BASE = os.environ.get("PLANARIA_KETI_CONV_API_BASE", "")
+KETI_CONV_MODEL = os.environ.get("PLANARIA_KETI_CONV_MODEL", "nota-ai/Solar-Open-100B-NotaMoEQuant-Int4")
 MAX_TOOL_ITERS = 40
 REQUEST_TIMEOUT = 90
 DEFAULT_CONTEXT_MAX_CHARS = 20000
@@ -1997,7 +2000,60 @@ class LLMClient:
         except Exception as e:
             return False, f"연결 실패: {e}"
 
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, timeout_sec: float | None = None) -> dict[str, Any]:
+    def _post_with_cancel(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload_json: str,
+        timeout: float,
+        cancel_event: threading.Event | None = None,
+    ) -> requests.Response:
+        if cancel_event is None:
+            return requests.post(url, headers=headers, data=payload_json, timeout=timeout)
+        if cancel_event.is_set():
+            raise RuntimeError("cancelled_by_client")
+
+        session = requests.Session()
+        done = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def _worker() -> None:
+            try:
+                outcome["resp"] = session.post(url, headers=headers, data=payload_json, timeout=timeout)
+            except Exception as e:
+                outcome["err"] = e
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        try:
+            while True:
+                if done.wait(timeout=0.1):
+                    break
+                if cancel_event.is_set():
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    done.wait(timeout=1.0)
+                    raise RuntimeError("cancelled_by_client")
+            if "err" in outcome:
+                raise outcome["err"]
+            return outcome["resp"]
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        timeout_sec: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
         has_primary = bool(self.api_key and self.api_base and self.models)
         has_fallback = bool(self.fallback_routes)
         if not has_primary and not has_fallback:
@@ -2042,7 +2098,15 @@ class LLMClient:
                 "model": model, "api_base": route_base, "url": url, "timeout_sec": timeout, "request": payload,
             }
             try:
-                resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("cancelled_by_client")
+                resp = self._post_with_cancel(
+                    url=url,
+                    headers=headers,
+                    payload_json=json.dumps(payload),
+                    timeout=timeout,
+                    cancel_event=cancel_event,
+                )
                 if resp.status_code >= 300:
                     last_error = RuntimeError(f"LLM request failed for model {model}: {resp.status_code} {resp.text[:500]}")
                     self._append_llm_trace({**trace_base, "status": "http_error", "http_status": resp.status_code, "response_text": safe_str(resp.text[:4000])})
@@ -2052,6 +2116,13 @@ class LLMClient:
                 parsed = resp.json()
                 self._append_llm_trace({**trace_base, "status": "ok", "http_status": resp.status_code, "response": parsed})
                 return parsed
+            except RuntimeError as e:
+                if str(e) == "cancelled_by_client":
+                    self._append_llm_trace({**trace_base, "status": "cancelled", "error_type": "RuntimeError", "error": safe_str(e)})
+                    raise
+                last_error = e
+                self._append_llm_trace({**trace_base, "status": "exception", "error_type": type(e).__name__, "error": safe_str(e)})
+                continue
             except requests.exceptions.Timeout as e:
                 last_error = e
                 self._append_llm_trace({**trace_base, "status": "exception", "error_type": type(e).__name__, "error": safe_str(e)})
@@ -2096,7 +2167,8 @@ class IntentClassifier:
     _MEMORY_RECALL_HINTS = [
         "기억나", "기억 하고", "기억하고 있", "기억하는", "기억된", "기억해둔",
         "기억 중", "이전에", "예전에", "했었던 말", "했던 말", "뭐가 있었지",
-        "뭐였는지", "나열해", "remembered", "do you remember", "what did i say",
+        "뭐였는지", "뭐였지", "내 이름이 뭐였", "어디서 일한다고 했", "나열해",
+        "remembered", "do you remember", "what did i say",
         "previously", "what do you know about me", "what have i told you",
     ]
     _WEB_GROUNDING_HINTS = [
@@ -2128,6 +2200,10 @@ class IntentClassifier:
     # "이름 알려줘" being blocked by the "알려" action hint.
     _IDENTITY_HINTS = ["이름이 뭐", "너의 이름", "네 이름", "이름은?", "뭐라고 불러", "넌 누구", "너 누구"]
     _SUMMARY_HINTS = ["요약", "정리", "브리핑", "summary", "summarize"]
+    _CAPABILITY_HINTS = [
+        "뭘 시킬 수", "뭐를 시킬 수", "무엇을 할 수", "뭐 할 수", "할 수 있어",
+        "기능", "capability", "capabilities", "what can you do",
+    ]
 
     @staticmethod
     def is_local_time_query(user_text: str) -> bool:
@@ -2181,6 +2257,13 @@ class IntentClassifier:
     def is_summary_request(user_text: str) -> bool:
         low = user_text.lower()
         return any(k in low for k in IntentClassifier._SUMMARY_HINTS)
+
+    @staticmethod
+    def is_capability_overview_query(user_text: str) -> bool:
+        low = (user_text or "").strip().lower()
+        if not low:
+            return False
+        return any(h in low for h in IntentClassifier._CAPABILITY_HINTS)
 
     @staticmethod
     def parse_tool_prohibitions(query: str, all_tool_names: list[str]) -> set[str]:
@@ -3184,10 +3267,12 @@ class ExecutionContext:
     loop_guard_pushed: bool = False
     forced_search_done: bool = False
     forced_memory_done: bool = False
+    memory_write_done: bool = False
     reflection_done: bool = False
     skepticism_done: bool = False
     associative_followup_done: bool = False
     skeptical_followup_done: bool = False
+    remembered_facts: set[str] = field(default_factory=set)
 
 
 class TaskExecutor:
@@ -3360,7 +3445,10 @@ class TaskExecutor:
         should_force_search = IntentClassifier.should_force_web_grounding(search_query) and prompt_class not in {
             "direct_dialog", "local_time", "memory_focused", "workspace_ops",
         }
-        should_force_memory = ("search_memory" in selected_tool_names) and (prompt_class != "direct_dialog")
+        should_force_memory = (
+            (prompt_class == "memory_focused")
+            or IntentClassifier.is_memory_recall_query(search_query)
+        )
 
         messages.append({"role": "system", "content": self.prompt_builder.build_task_prompt(search_query, prompt_class, selected_tool_names)})
         self.engine._log_runtime({"type": "execution_strategy", "query": search_query, "prompt_class": prompt_class, "allowed_tools": selected_tool_names, "route_meta": route_meta})
@@ -3403,6 +3491,15 @@ class TaskExecutor:
         if ctx.should_force_memory and not ctx.forced_memory_done:
             ctx.forced_memory_done = True
             search_query = self.engine._latest_user_query(messages)
+            self.engine._log_runtime({
+                "type": "tool_call_origin",
+                "iteration": iter_idx,
+                "internal_calls": 1,
+                "external_calls": 0,
+                "internal_tools": ["search_memory"],
+                "external_tools": [],
+                "tool_call_details": [{"name": "search_memory", "args": {"query": search_query[:200], "limit": 5}}],
+            })
             mem_result = self.dispatcher.dispatch("search_memory", {"query": search_query[:200], "limit": 5})
             ctx.total_tool_calls += 1
             did_bootstrap = True
@@ -3413,6 +3510,15 @@ class TaskExecutor:
             if ctx.should_force_search and not ctx.associative_followup_done:
                 assoc_q = self._build_associative_query_from_memory(search_query, mem_result if isinstance(mem_result, dict) else {})
                 if assoc_q and assoc_q != ctx.forced_search_query:
+                    self.engine._log_runtime({
+                        "type": "tool_call_origin",
+                        "iteration": iter_idx,
+                        "internal_calls": 1,
+                        "external_calls": 0,
+                        "internal_tools": ["web_search"],
+                        "external_tools": [],
+                        "tool_call_details": [{"name": "web_search", "args": {"query": assoc_q}}],
+                    })
                     assoc_result = self.dispatcher.dispatch("web_search", {"query": assoc_q})
                     ctx.total_tool_calls += 1
                     ctx.associative_followup_done = True
@@ -3429,6 +3535,15 @@ class TaskExecutor:
 
         if ctx.should_force_search and ctx.forced_search_query and not ctx.forced_search_done:
             ctx.forced_search_done = True
+            self.engine._log_runtime({
+                "type": "tool_call_origin",
+                "iteration": iter_idx,
+                "internal_calls": 1,
+                "external_calls": 0,
+                "internal_tools": ["web_search"],
+                "external_tools": [],
+                "tool_call_details": [{"name": "web_search", "args": {"query": ctx.forced_search_query}}],
+            })
             web_result = self.dispatcher.dispatch("web_search", {"query": ctx.forced_search_query})
             ctx.total_tool_calls += 1
             did_bootstrap = True
@@ -3475,11 +3590,25 @@ class TaskExecutor:
                 args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except Exception:
                 args = {}
+            if not isinstance(args, dict):
+                args = {}
             signature = ToolCallParser.tool_signature(name, args if isinstance(args, dict) else {})
             ctx.tool_signature_counts[signature] = ctx.tool_signature_counts.get(signature, 0) + 1
 
             if ctx.selected_tool_names and name not in ctx.selected_tool_names and is_internal_tool_name(name):
                 result = {"ok": False, "error": f"Tool '{name}' is not in the allowed tool set for this task. Use only: {', '.join(ctx.selected_tool_names)}"}
+            elif name == "remember_fact":
+                fact_key = str(args.get("fact", "")).strip().lower()
+                if fact_key and fact_key in ctx.remembered_facts:
+                    result = {"ok": True, "dedup": True, "fact": args.get("fact", ""), "note": "already_remembered_in_this_turn"}
+                    ctx.force_finalize_mode = True
+                else:
+                    result = self.dispatcher.dispatch(name, args)
+                    if isinstance(result, dict) and result.get("ok") and fact_key:
+                        ctx.remembered_facts.add(fact_key)
+                        if ctx.prompt_class == "memory_focused":
+                            ctx.memory_write_done = True
+                            ctx.force_finalize_mode = True
             elif ctx.tool_signature_counts[signature] > 1:
                 result = {"ok": False, "error": f"이미 동일한 호출을 수행했습니다. 결과를 확인하고 사용자에게 답변하세요. 추가 도구 호출 없이 답변을 생성하세요."}
                 ctx.force_finalize_mode = True
@@ -3492,6 +3621,8 @@ class TaskExecutor:
             sanitized_result = ToolDispatcher.compact_tool_result(name, result)
             ctx.last_tool_note = safe_json_dumps(sanitized_result, ensure_ascii=False)[:800]
             messages.append({"role": "system", "content": f"Tool result ({name}):\n" + safe_json_dumps(sanitized_result, ensure_ascii=False)[:2500]})
+            if name == "remember_fact" and ctx.memory_write_done:
+                messages.append({"role": "system", "content": "memory_focused 저장이 완료되었습니다. 추가 도구 호출 없이 저장 결과를 한 줄로 확인하고 최종 답변을 종료하세요."})
 
         # Check for context reask in assistant text alongside tool calls
         if IntentClassifier.is_context_reask_text(text):
@@ -3593,8 +3724,17 @@ class TaskExecutor:
             return None
 
         try:
-            out = self.client.chat(messages=[{"role": "system", "content": prompt}], tools=[], timeout_sec=10.0)
+            out = self.client.chat(
+                messages=[{"role": "system", "content": prompt}],
+                tools=[],
+                timeout_sec=10.0,
+                cancel_event=self.engine._cancel_event,
+            )
             reply = (out.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        except RuntimeError as e:
+            if str(e) == "cancelled_by_client":
+                return None
+            return None  # reflection failure should never block the response
         except Exception:
             return None  # reflection failure should never block the response
 
@@ -3616,6 +3756,8 @@ class TaskExecutor:
 
         Returns: (possibly_revised_answer, verdict, revised_flag)
         """
+        if ctx.prompt_class in {"factcheck_focused", "workspace_ops"}:
+            return final_answer, "skip_latency_sensitive_class", False
         if not final_answer.strip():
             return final_answer, "skip_empty", False
         called_tools = sorted(set(sig.split(":", 1)[0] for sig in ctx.tool_signature_counts.keys()))
@@ -3646,6 +3788,7 @@ class TaskExecutor:
                     messages=[{"role": "system", "content": skeptic_prompt}],
                     tools=[],
                     timeout_sec=8.0,
+                    cancel_event=self.engine._cancel_event,
                 )
                 raw = (out.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
                 blocks = ToolCallParser.extract_json_blocks(raw)
@@ -3724,7 +3867,23 @@ class TaskExecutor:
             effective_timeout = float(LLM_QUERY_TIMEOUT_SEC)
             if ctx.prompt_class in ("coding_ops", "skill_ops"):
                 effective_timeout = float(LLM_QUERY_TIMEOUT_MAX_SEC) * 2  # 80s for code gen
-            out = self.client.chat(messages=messages, tools=current_tools, timeout_sec=effective_timeout)
+            try:
+                out = self.client.chat(
+                    messages=messages,
+                    tools=current_tools,
+                    timeout_sec=effective_timeout,
+                    cancel_event=self.engine._cancel_event,
+                )
+            except RuntimeError as e:
+                if str(e) == "cancelled_by_client" or self.engine._cancel_event.is_set():
+                    self.engine._log_runtime({
+                        "type": "cancelled",
+                        "iteration": iter_idx,
+                        "tool_calls": ctx.total_tool_calls,
+                        "where": "llm_chat",
+                    })
+                    return "[cancelled by client]"
+                raise
             message = out.get("choices", [{}])[0].get("message", {})
             tool_calls = message.get("tool_calls") or []
             text = (message.get("content") or "").strip()
@@ -3915,6 +4074,20 @@ class AgentEngine:
                 f"안녕하세요. 저는 {display_name}({self.config.agent_name})입니다. "
                 "PLANARIA_ONE 에이전트로 요청을 도와드릴 수 있어요."
             )
+        if IntentClassifier.is_capability_overview_query(user_text):
+            lines = [
+                "제가 바로 도와드릴 수 있는 대표 기능입니다.",
+                "1) 웹 검색 기반 최신 정보 요약",
+                "2) 파일 읽기/쓰기/목록 조회",
+                "3) 메모 저장/회상",
+                "4) 예약 작업 등록/조회/취소",
+            ]
+            cfg = safe_json_load(self.config.workspace / "config.json", {})
+            has_srt = bool(cfg.get("connectors", {}).get("srt_id"))
+            if has_srt:
+                lines.append("5) SRT 조회/예약")
+            lines.append("원하시는 작업을 자연어로 바로 말씀해 주세요.")
+            return "\n".join(lines)
         if prompt_class == "local_time" or IntentClassifier.is_local_time_query(user_text):
             kst = datetime.now(timezone(timedelta(hours=9)))
             utc = datetime.now(timezone.utc)
@@ -3934,6 +4107,16 @@ class AgentEngine:
             if name:
                 all_names.append(name)
 
+        if IntentClassifier.is_capability_overview_query(user_text):
+            return [], [], "direct_dialog", {"reason": "capability_overview_fastpath", "scores": {"direct_dialog": 1}}
+        if IntentClassifier.is_memory_recall_query(user_text):
+            # Keep memory recall away from short dialog fast-path.
+            return (
+                [s for s in all_tools if str(s.get("function", {}).get("name", "")) in {"search_memory", "remember_fact"}],
+                [n for n in all_names if n in {"search_memory", "remember_fact"}],
+                "memory_focused",
+                {"reason": "memory_recall_priority", "scores": {"memory_focused": 1}},
+            )
         if IntentClassifier.is_simple_dialog_query(user_text):
             return [], [], "direct_dialog", {"reason": "short_social_dialog", "scores": {"direct_dialog": 1}}
         if IntentClassifier.is_local_time_query(user_text):
@@ -3970,6 +4153,13 @@ class AgentEngine:
                 best_score = score
                 prompt_class = cls
 
+        # Heuristic override: "검색 + 기억" mixed query should remain research-first.
+        has_research_phrase = any(k in query for k in ["검색", "latest", "news", "트렌드", "trend", "동향", "최신", "뉴스"])
+        has_memory_phrase = any(k in query for k in ["기억", "remember"])
+        if has_research_phrase and has_memory_phrase:
+            prompt_class = "research_focused"
+            reasons.setdefault("heuristic_override", []).append("research_plus_memory -> research_focused")
+
         class_tools: dict[str, set[str]] = {
             "research_focused": {"web_search", "search_hub", "search_memory"},
             "factcheck_focused": {"web_search", "search_memory"},
@@ -3996,6 +4186,15 @@ class AgentEngine:
         if any(k in query for k in ["기억", "remember"]):
             selected.add("remember_fact")
             reasons.setdefault("cross_intent", []).append("memory_detected")
+
+        # SRT-intent should prefer skill_ops over generic schedule routing.
+        srt_signals = ("srt", "수서", "부산", "대전", "열차", "기차")
+        has_srt_tool = any(n == "srt_reserve" for n in all_names)
+        if has_srt_tool and any(k in query for k in srt_signals):
+            prompt_class = "skill_ops"
+            selected = set(class_tools.get("skill_ops", set()))
+            selected.add("srt_reserve")
+            reasons.setdefault("heuristic_override", []).append("srt_query -> skill_ops")
 
         # When routed to skill_ops, include ALL external skills so the LLM knows about them
         if prompt_class == "skill_ops":
@@ -4115,6 +4314,7 @@ class AgentEngine:
             out = self.client.chat(
                 [{"role": "system", "content": "Extract knowledge graph facts. Output raw JSON array only."}, {"role": "user", "content": extraction_prompt}],
                 timeout_sec=float(LLM_QUERY_TIMEOUT_SEC),
+                cancel_event=self._cancel_event,
             )
             text = out.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             start = text.find("[")
@@ -4140,6 +4340,11 @@ class AgentEngine:
                     saved.append({"fact": fact, "layer": result.get("layer", layer), "entity": entity})
             if saved:
                 self._log_runtime({"type": "auto_graph_extraction", "source": source, "user_id": user_id, "count": len(saved), "facts": saved[:4]})
+        except RuntimeError as e:
+            if str(e) == "cancelled_by_client":
+                self._log_runtime({"type": "auto_graph_extraction_cancelled"})
+                return
+            self._log_runtime({"type": "auto_graph_extraction_error", "error": f"{type(e).__name__}: {safe_str(e)}"})
         except Exception as e:
             self._log_runtime({"type": "auto_graph_extraction_error", "error": f"{type(e).__name__}: {safe_str(e)}"})
 
@@ -4165,11 +4370,17 @@ class AgentEngine:
             out = self.client.chat(
                 [{"role": "system", "content": "You are a response editor that merges and deduplicates multi-task outputs."}, {"role": "user", "content": synthesis_prompt}],
                 timeout_sec=float(LLM_QUERY_TIMEOUT_SEC),
+                cancel_event=self._cancel_event,
             )
             synthesized = out.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if synthesized and len(synthesized) > 50:
                 self._log_runtime({"type": "task_synthesis_complete", "input_tasks": len(task_outputs), "output_chars": len(synthesized)})
                 return synthesized
+        except RuntimeError as e:
+            if str(e) == "cancelled_by_client":
+                self._log_runtime({"type": "task_synthesis_cancelled"})
+                return "\n\n".join(task_outputs)
+            self._log_runtime({"type": "task_synthesis_failed", "error": f"{type(e).__name__}: {safe_str(e)}"})
         except Exception as e:
             self._log_runtime({"type": "task_synthesis_failed", "error": f"{type(e).__name__}: {safe_str(e)}"})
         return "\n\n".join(task_outputs)
@@ -4251,7 +4462,7 @@ class AgentEngine:
                 )},
                 {"role": "user", "content": user_text},
             ]
-            result = self.client.chat(messages, timeout_sec=10)
+            result = self.client.chat(messages, timeout_sec=10, cancel_event=self._cancel_event)
             answer = str(result.get("content") or "").strip().lower()
             if answer in ("telegram", "gmail", "calendar", "srt", "skip"):
                 return answer
@@ -4390,13 +4601,19 @@ class AgentEngine:
             low = text.lower().strip()
             # Hidden preset
             if low == "keti-conv":
+                if not KETI_CONV_API_BASE:
+                    return (
+                        "keti-conv 프리셋은 환경변수 PLANARIA_KETI_CONV_API_BASE가 설정되어 있어야 사용할 수 있습니다.\n"
+                        "다른 서비스를 선택하거나 관리자에게 문의하세요.\n"
+                        "서비스 번호 또는 이름을 다시 입력해주세요:"
+                    )
                 self.secrets.store("llm_api_key", "keti-conv")
                 cfg_path = self.config.workspace / "config.json"
                 data = safe_json_load(cfg_path, {})
                 if "llm" not in data:
                     data["llm"] = {}
-                data["llm"]["models"] = ["nota-ai/Solar-Open-100B-NotaMoEQuant-Int4"]
-                data["llm"]["api_base"] = "http://keti-conv.internal.invalid/v1"
+                data["llm"]["models"] = [KETI_CONV_MODEL]
+                data["llm"]["api_base"] = KETI_CONV_API_BASE
                 data["llm"]["api_key"] = SecretStore.make_ref("llm_api_key")
                 data["llm"]["context_max_chars"] = 2600
                 data["llm"]["compressed_context_chars"] = 1800
@@ -4407,10 +4624,10 @@ class AgentEngine:
                 data["onboarding"]["llm_provider"] = "keti-conv"
                 write_json(cfg_path, data)
                 self.config.api_key = "keti-conv"
-                self.config.models = ["nota-ai/Solar-Open-100B-NotaMoEQuant-Int4"]
-                self.config.api_base = "http://keti-conv.internal.invalid/v1"
+                self.config.models = [KETI_CONV_MODEL]
+                self.config.api_base = KETI_CONV_API_BASE
                 self.client.api_key = "keti-conv"
-                self.client.api_base = "http://keti-conv.internal.invalid/v1"
+                self.client.api_base = KETI_CONV_API_BASE
                 self.client.models = self.config.models
                 self._set_onboarding_stage("wait_keti_deepseek_key")
                 return (
@@ -4753,7 +4970,10 @@ class AgentEngine:
             # JobBreaker decomposition causes confusion: it creates "search first" sub-tasks
             # that waste time on web_search and then the LLM summarizes the empty web results
             # instead of the actual tool output. V4.1 regression fix.
-            skip_job_breaker = pre_prompt_class in ("skill_ops", "schedule_ops", "direct_dialog", "local_time", "email_ops")
+            skip_job_breaker = pre_prompt_class in (
+                "skill_ops", "schedule_ops", "workspace_ops",
+                "memory_focused", "direct_dialog", "local_time", "email_ops",
+            )
 
             if skip_job_breaker:
                 job_plan = {"refined_goal": user_text, "constraints": [], "tasks": [user_text]}

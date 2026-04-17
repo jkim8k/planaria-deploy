@@ -1,0 +1,24 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "planaria_one allowlist"
+paths = [
+  '''^key_config\.json$''',
+  '''^\.env(\..*)?$''',
+  '''^workspace_fox/''',
+  '''^workspace_v4test/''',
+  '''^workspace_e2etest/''',
+  '''^workspace_ipcobtest/''',
+  '''^workspace_srttest/''',
+  '''^workspace_default/secrets\.json$''',
+  '''^backup/''',
+  '''^logs/''',
+  '''\.bak\.py$''',
+  '''\.pre_refactor\.py$''',
+]
+regexes = [
+  '''sk-or-v1-(testkey|newkey|abcdef|freekey|fakekey)[A-Za-z0-9]*''',
+  '''sk-fake-[A-Za-z0-9-]+''',
+  '''TEST-API-KEY-[A-Za-z0-9-]+''',
+]
