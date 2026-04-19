@@ -4157,10 +4157,16 @@ class AgentEngine:
                 "memory_focused",
                 {"reason": "memory_recall_priority", "scores": {"memory_focused": 1}},
             )
-        if IntentClassifier.is_memory_store_query(user_text):
-            # Explicit fact save requests must land on remember_fact directly.
-            # Keeping search_memory available lets the model check for
-            # duplicates, but remember_fact is the required action.
+        if (
+            IntentClassifier.is_memory_store_query(user_text)
+            and not IntentClassifier.should_force_web_grounding(user_text)
+        ):
+            # Pure-save intents (e.g., "내 이름은 지민이야. 기억해둬.") get a
+            # tight memory-only tool slice so the model cannot wander off into
+            # web_search loops. Combined "검색해서 기억해둬" requests fall
+            # through to the general classifier, which keeps web_search in
+            # scope while the memory_focused prompt still teaches the model
+            # to finish with remember_fact.
             return (
                 [s for s in all_tools if str(s.get("function", {}).get("name", "")) in {"remember_fact", "search_memory"}],
                 [n for n in all_names if n in {"remember_fact", "search_memory"}],
