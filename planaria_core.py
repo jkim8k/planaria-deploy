@@ -2763,10 +2763,11 @@ Your current capabilities:
             ],
             "schedule_ops": [
                 "- Distinguish three intents: REGISTER, LIST, CANCEL.",
-                "- REGISTER ('매일/매주 X시에 ... 해줘'): call schedule_task IMMEDIATELY. Do NOT search the web. Do NOT ask clarifying questions.",
+                "- REGISTER ('매일/매주 X시에 ... 해줘'): call schedule_task EXACTLY ONCE. Do NOT search the web. Do NOT ask clarifying questions.",
                 "  - Time conversion: KST = UTC+9. e.g., KST 08:00 = UTC 23:00 (previous day).",
                 "  - schedule_task(run_at_utc='YYYY-MM-DDTHH:MM:SSZ', task_prompt='user request', recurrence='daily|weekly|monthly|none')",
                 "  - task_prompt = user's original request, so the agent knows what to do when triggered.",
+                "  - CRITICAL: call it ONCE. If you see a 'duplicate_in_turn' response, that means YOUR PREVIOUS CALL already registered the task just now — do NOT interpret this as 'the task was already scheduled before'. Confirm the fresh registration to the user.",
                 "- LIST ('등록된 작업 뭐 있어?', '내 스케줄 보여줘', '예약된 거 알려줘', \"what's scheduled?\"): call list_scheduled_tasks. NEVER fabricate tasks. If empty, say so honestly.",
                 "- CANCEL ('X 작업 취소해줘', '방금 등록한 ... 취소'): call list_scheduled_tasks FIRST to resolve the task_id, then IMMEDIATELY call cancel_scheduled_task(task_id=...). You MUST end with cancel_scheduled_task — listing alone is not enough. Do NOT call web_search for a cancel request.",
                 "- After REGISTER, confirm what was scheduled, when (KST), and what will run.",
@@ -3669,7 +3670,22 @@ class TaskExecutor:
                             ctx.memory_write_done = True
                             ctx.force_finalize_mode = True
             elif ctx.tool_signature_counts[signature] > 1:
-                result = {"ok": False, "error": f"이미 동일한 호출을 수행했습니다. 결과를 확인하고 사용자에게 답변하세요. 추가 도구 호출 없이 답변을 생성하세요."}
+                # Per-turn duplicate: the FIRST call's result is still valid.
+                # We return ok=True with an explicit note so the model does
+                # not mistake this for 'the task is already registered' and
+                # relay a confusing 'already scheduled' message to the user.
+                result = {
+                    "ok": True,
+                    "dedup": True,
+                    "duplicate_in_turn": True,
+                    "note": (
+                        f"'{name}' was already called with identical args earlier in THIS turn. "
+                        "The earlier call's side effects (e.g., schedule insertion, fact save) are "
+                        "already applied. Do NOT tell the user the task 'was already scheduled from "
+                        "before' — it was scheduled just now by your previous call. Reuse the prior "
+                        "result and write the final confirmation message to the user."
+                    ),
+                }
                 ctx.force_finalize_mode = True
             else:
                 result = self.dispatcher.dispatch(name, args)
