@@ -2156,10 +2156,22 @@ class LLMClient:
 class IntentClassifier:
     """All keyword-based intent detection in one place. No state, all static methods."""
 
+    # Intent hints for "what time is it now?" style queries. Deliberately
+    # narrow — the fast-path returns a local-time string only, so any false
+    # positive hijacks the turn. Tokens like "kst" or bare "현재 시간" match
+    # mid-sentence in conversations about scheduling/news and must stay out
+    # of this list.
     _LOCAL_TIME_HINTS = [
-        "몇시", "몇 시", "지금 시간", "현재 시간", "시간이 몇",
-        "what time", "current time", "time is it", "시스템 시간",
-        "로컬 시간", "현재 시각", "local system time", "kst",
+        "몇시", "몇 시", "지금 시간", "시간이 몇",
+        "what time is it", "current time", "time is it now",
+        "시스템 시간", "로컬 시간", "현재 시각", "local system time",
+    ]
+    _LOCAL_TIME_MAX_LEN = 30
+    # Negations that mean "not about the current time" — when any of these
+    # appears near the hint, skip the fast-path.
+    _LOCAL_TIME_NEGATIONS = [
+        "아니", "말고", "말구", "아니라", "아니에요",
+        "not the", "not about",
     ]
     _MEMORY_STORE_HINTS = [
         "기억해", "기억해둬", "기억해줘", "잘 기억", "remember this", "remember that",
@@ -2215,7 +2227,14 @@ class IntentClassifier:
     @staticmethod
     def is_local_time_query(user_text: str) -> bool:
         low = (user_text or "").strip().lower()
-        return bool(low) and any(h in low for h in IntentClassifier._LOCAL_TIME_HINTS)
+        if not low:
+            return False
+        # Long messages are almost certainly not a bare "what time is it".
+        if len(low) > IntentClassifier._LOCAL_TIME_MAX_LEN:
+            return False
+        if any(neg in low for neg in IntentClassifier._LOCAL_TIME_NEGATIONS):
+            return False
+        return any(h in low for h in IntentClassifier._LOCAL_TIME_HINTS)
 
     @staticmethod
     def is_memory_store_query(user_text: str) -> bool:
