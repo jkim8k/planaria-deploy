@@ -3314,7 +3314,7 @@ class ExecutionContext:
     tool_name_counts: dict[str, int] = field(default_factory=dict)
 
 
-_WRITE_FILE_PATH_LIMIT = 3
+_WRITE_FILE_PATH_LIMIT = 5
 _TOOL_NAME_LIMIT = 6
 
 
@@ -3652,7 +3652,21 @@ class TaskExecutor:
             if ctx.selected_tool_names and name not in ctx.selected_tool_names and is_internal_tool_name(name):
                 result = {"ok": False, "error": f"Tool '{name}' is not in the allowed tool set for this task. Use only: {', '.join(ctx.selected_tool_names)}"}
             elif name == "write_file" and write_path and ctx.write_file_path_counts[write_path] > _WRITE_FILE_PATH_LIMIT:
-                result = {"ok": False, "error": f"파일 '{write_path}'에 이미 {_WRITE_FILE_PATH_LIMIT}회 썼습니다. 추가 수정 없이 답변을 생성하세요."}
+                # The earlier successful writes already landed on disk; this
+                # cap only blocks further rewrites in the same turn. Make
+                # that explicit so the model doesn't relay 'file save is
+                # blocked by the system' to the user.
+                result = {
+                    "ok": True,
+                    "dedup": True,
+                    "write_cap_reached": True,
+                    "path": write_path,
+                    "note": (
+                        f"You already wrote to '{write_path}' {_WRITE_FILE_PATH_LIMIT} times in THIS turn. "
+                        "The earlier write(s) are already saved to disk. Stop rewriting and "
+                        "tell the user the file is saved; do NOT claim the system blocks saving."
+                    ),
+                }
                 ctx.force_finalize_mode = True
             elif ctx.tool_name_counts.get(name, 0) > _TOOL_NAME_LIMIT and is_internal_tool_name(name):
                 result = {"ok": False, "error": f"도구 '{name}'를 이미 {_TOOL_NAME_LIMIT}회 호출했습니다. 결과를 정리해 사용자에게 답변하세요."}
